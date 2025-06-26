@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, ReactNode } from 'react';
 
 // Define chains we support
-export type ChainType = 'ethereum' | 'arbitrum' | 'solana' | 'base' | 'bnb' | 'holesky';
+export type ChainType = 'ethereum' | 'arbitrum' | 'solana' | 'base' | 'bnb' | 'holesky' | 'sepolia';
 
 // Chain configuration
 interface ChainConfig {
@@ -111,6 +111,21 @@ const chainConfigs: Record<ChainType, ChainConfig> = {
       decimals: 18
     }
   },
+  sepolia: {
+    name: 'Sepolia',
+    id: '0xaa36a7',
+    icon: '🟢',
+    symbol: 'ETH',
+    explorerUrl: 'https://sepolia.etherscan.io',
+    rpcUrl: 'https://sepolia.infura.io/v3/2dac7bca68234491820c725b40c03cf3',
+    isEVM: true,
+    tokenListUrl: '',
+    nativeCurrency: {
+      name: 'Ethereum',
+      symbol: 'ETH',
+      decimals: 18
+    }
+  },
 };
 
 // Context type
@@ -127,8 +142,8 @@ const ChainContext = createContext<ChainContextType | undefined>(undefined);
 
 // Provider component
 export const ChainProvider = ({ children }: { children: ReactNode }) => {
-  const [currentChain, setCurrentChain] = useState<ChainType>('ethereum');
-  const chains: ChainType[] = ['ethereum', 'arbitrum', 'solana', 'base', 'bnb', 'holesky'];
+  const [currentChain, setCurrentChain] = useState<ChainType>('sepolia');
+  const chains: ChainType[] = ['ethereum', 'arbitrum', 'solana', 'base', 'bnb', 'holesky', 'sepolia'];
 
   const setChain = (chain: ChainType) => {
     setCurrentChain(chain);
